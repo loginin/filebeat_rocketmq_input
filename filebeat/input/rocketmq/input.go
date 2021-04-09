@@ -2,16 +2,17 @@ package rocketmq
 
 import (
 	"context"
+	"fmt"
 	"github.com/apache/rocketmq-client-go/v2"
 	"github.com/apache/rocketmq-client-go/v2/consumer"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
+	"github.com/apache/rocketmq-client-go/v2/rlog"
 	"github.com/elastic/beats/v7/filebeat/channel"
 	"github.com/elastic/beats/v7/filebeat/input"
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/pkg/errors"
-	"sync"
 	"time"
 )
 
@@ -28,7 +29,6 @@ type rocketmqInput struct {
 	context        input.Context
 	outlet         channel.Outleter
 	log            *logp.Logger
-	runOnce        sync.Once
 	consumer       rocketmq.PushConsumer
 }
 
@@ -37,10 +37,13 @@ func NewInput(
 	connector channel.Connector,
 	inputContext input.Context,
 ) (input.Input, error) {
+	fmt.Println("rocketmq input start---------------------------------")
 	config := defaultConfig()
 	if err := cfg.Unpack(&config); err != nil {
 		return nil, errors.Wrap(err, "reading rocketmq input config")
 	}
+
+	rlog.SetLogLevel(config.LogLevel)
 
 	out, err := connector.ConnectWith(cfg, beat.ClientConfig{
 		CloseRef:  doneChannelContext(inputContext.Done),
@@ -57,12 +60,7 @@ func NewInput(
 		return nil, err
 	}
 
-	err = p.Start()
-	if err != nil {
-		return nil, err
-	}
-
-	ri := &rocketmqInput{
+	ipt := &rocketmqInput{
 		config:         config,
 		rocketmqConfig: conf,
 		context:        inputContext,
@@ -70,30 +68,34 @@ func NewInput(
 		log:            logp.NewLogger("rocketmq input").With("hosts", config.NameServerAddrs),
 		consumer:       p,
 	}
-	return ri, nil
+
+	ipt.consumer.Subscribe(ipt.rocketmqConfig.topic, ipt.rocketmqConfig.msgSelector,
+		func(ctx context.Context, msgs ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
+			//fmt.Printf("=================subscribe callback: %v \n", msgs)
+			//create Events
+			events := ipt.createEvents(msgs...)
+			for _, event := range events {
+				ipt.outlet.OnEvent(event)
+			}
+			return consumer.ConsumeSuccess, nil
+		})
+	ipt.consumer.Start()
+
+	go func() {
+		for {
+			select {
+			case <-ipt.context.Done:
+			case <-ipt.context.BeatDone:
+				ipt.stopRocketmq()
+				return
+			}
+		}
+	}()
+
+	return ipt, nil
 }
 
 func (input *rocketmqInput) Run() {
-	input.runOnce.Do(func() {
-		go func() {
-			c := doneChannelContext(input.context.Done)
-			for c.Err() == nil {
-				err := input.consumer.Subscribe(input.rocketmqConfig.topic, input.rocketmqConfig.msgSelector,
-					func(ctx context.Context, msgs ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
-						//fmt.Printf("subscribe callback: %v \n", msgs)
-						//create Events
-						events := input.createEvents(msgs...)
-						for _, event := range events {
-							input.outlet.OnEvent(event)
-						}
-						return consumer.ConsumeSuccess, nil
-					})
-				if err != nil {
-					panic(err)
-				}
-			}
-		}()
-	})
 }
 func (input *rocketmqInput) checkTags(msg *primitive.MessageExt) bool {
 	if input.config.RouteTag == "" {
@@ -125,11 +127,16 @@ func (input *rocketmqInput) createEvents(msgs ...*primitive.MessageExt) []beat.E
 	}
 	return events
 }
-func (input *rocketmqInput) Stop() {
+func (input *rocketmqInput) stopRocketmq() {
 	input.consumer.Shutdown()
+	input.consumer.Unsubscribe(input.rocketmqConfig.topic)
+}
+func (input *rocketmqInput) Stop() {
+	fmt.Println("rocketmq input Stop---------------------------------")
+	input.stopRocketmq()
 }
 func (input *rocketmqInput) Wait() {
-	input.consumer.Unsubscribe(input.rocketmqConfig.topic)
+	fmt.Println("rocketmq input wait---------------------------------")
 	input.Stop()
 }
 
